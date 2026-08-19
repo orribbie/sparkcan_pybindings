@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)   # need >=3.11 for FetchContent; you have 3.22
 project(sparkcan VERSION 1.0 LANGUAGES CXX)
 
+include(CTest)
+
 # -----------------------------
 # C++ settings (unchanged)
 # -----------------------------
@@ -32,6 +34,12 @@ add_executable(example_status  examples/status.cpp)
 target_link_libraries(example_control PRIVATE sparkcan)
 target_link_libraries(example_pid     PRIVATE sparkcan)
 target_link_libraries(example_status  PRIVATE sparkcan)
+
+if(BUILD_TESTING)
+  add_executable(firmware25_protocol_test tests/firmware25_protocol_test.cpp)
+  target_link_libraries(firmware25_protocol_test PRIVATE sparkcan)
+  add_test(NAME firmware25_protocol_test COMMAND firmware25_protocol_test)
+endif()
 
 # -----------------------------
 # Install core C++ lib (unchanged)

@@ -9,6 +9,7 @@
 #include <atomic>          // std::atomic
 #include <system_error>    // nicer errno -> exception
 #include <iostream>
+#include <sstream>
 
 int  SparkBase::soc_ = -1;
 std::atomic<bool> SparkBase::rxRunning_{false};
@@ -85,11 +86,13 @@ SparkBase::SparkBase(const std::string & interfaceName, uint8_t deviceId)
 
 SparkBase::~SparkBase()
 {
-
-  std::lock_guard<std::mutex> lk(registryMtx_);
-  registry_.erase(deviceId_);
-  if (registry_.empty()) StopRxThread();   // last motor → shut the reader down
-
+  bool stopRx = false;
+  {
+    std::lock_guard<std::mutex> lk(registryMtx_);
+    registry_.erase(deviceId_);
+    stopRx = registry_.empty();
+  }
+  if (stopRx) StopRxThread();   // last motor → shut the reader down
 }
 
 /* ────────────────────────────────────────────────────────────── *
@@ -159,26 +162,7 @@ void SparkBase::SendCanFrame(APICommand cmd, const std::vector<uint8_t> & data) 
   frame.can_dlc = static_cast<uint8_t>(data.size());
   std::memcpy(frame.data, data.data(), data.size());
 
-  constexpr std::chrono::milliseconds WAIT_TIME(1);
-  constexpr int MAX_ATTEMPTS = 1000;
-
-  for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
-    ssize_t bytesSent = write(soc_, &frame, sizeof(frame));
-    if (bytesSent == sizeof(frame)) {
-      return;
-    }
-
-    if (bytesSent < 0 && (errno == ENOBUFS || errno == EAGAIN)) {
-      std::this_thread::sleep_for(WAIT_TIME);
-      continue;
-    }
-
-    throw std::runtime_error(
-            RED "Failed to send CAN frame: " + std::string(strerror(errno)) +
-            RESET);
-  }
-
-  throw std::runtime_error(RED "Failed to send CAN frame: Buffer consistently full." RESET);
+  SendRawCanFrame(frame);
 }
 
 void SparkBase::SendCanFrame(uint32_t arbId, const std::vector<uint8_t> & data) const
@@ -192,6 +176,11 @@ void SparkBase::SendCanFrame(uint32_t arbId, const std::vector<uint8_t> & data) 
   frame.can_dlc = static_cast<uint8_t>(data.size());
   std::memcpy(frame.data, data.data(), data.size());
 
+  SendRawCanFrame(frame);
+}
+
+void SparkBase::SendRawCanFrame(const can_frame & frame) const
+{
   constexpr std::chrono::milliseconds WAIT_TIME(1);
   constexpr int MAX_ATTEMPTS = 1000;
 
@@ -208,6 +197,53 @@ void SparkBase::SendCanFrame(uint32_t arbId, const std::vector<uint8_t> & data) 
   }
 
   throw std::runtime_error("Failed to send CAN frame: Buffer consistently full.");
+}
+
+can_frame SparkBase::RequestResponse(
+  const can_frame & request, uint32_t responseArbId,
+  std::chrono::microseconds timeout, int attempts)
+{
+  if (attempts < 1) {
+    throw std::invalid_argument("Request attempts must be at least one");
+  }
+
+  std::lock_guard<std::mutex> transactionLock(parameterTransactionMutex_);
+  for (int attempt = 1; attempt <= attempts; ++attempt) {
+    {
+      std::lock_guard<std::mutex> responseLock(responseMutex_);
+      pendingResponseId_ = responseArbId;
+      pendingResponse_.reset();
+    }
+
+    try {
+      SendRawCanFrame(request);
+    } catch (...) {
+      std::lock_guard<std::mutex> responseLock(responseMutex_);
+      pendingResponseId_.reset();
+      pendingResponse_.reset();
+      if (attempt == attempts) throw;
+      continue;
+    }
+
+    std::unique_lock<std::mutex> responseLock(responseMutex_);
+    bool received = responseCv_.wait_for(
+      responseLock, timeout, [this] { return pendingResponse_.has_value(); });
+    if (received) {
+      can_frame response = *pendingResponse_;
+      pendingResponseId_.reset();
+      pendingResponse_.reset();
+      return response;
+    }
+    pendingResponseId_.reset();
+    pendingResponse_.reset();
+  }
+
+  throw std::runtime_error(
+    "Timed out waiting for CAN response 0x" + [&] {
+      std::ostringstream stream;
+      stream << std::hex << std::uppercase << responseArbId;
+      return stream.str();
+    }());
 }
 
 uint8_t SparkBase::GetAPIClass(APICommand cmd) const
@@ -230,11 +266,20 @@ uint32_t SparkBase::CreateArbId(APICommand cmd) const
          static_cast<uint32_t>(deviceId_);
 }
 
-uint32_t SparkBase::CreateParamArbId(Parameter paramId) const
+uint32_t SparkBase::CreateParamReadArbId(Parameter paramId) const
 {
-  return (static_cast<uint32_t>(DEVICE_TYPE) << 24) | (static_cast<uint32_t>(MANUFACTURER) << 16) |
-         (static_cast<uint32_t>(48) <<
-         10) | (static_cast<uint32_t>(paramId) << 6) | static_cast<uint32_t>(deviceId_);
+  return sparkcan::firmware25::ParameterReadArbId(
+    deviceId_, static_cast<uint32_t>(paramId));
+}
+
+uint32_t SparkBase::CreateParamWriteArbId() const
+{
+  return sparkcan::firmware25::ParameterWriteArbId(deviceId_);
+}
+
+uint32_t SparkBase::CreateParamWriteResponseArbId() const
+{
+  return sparkcan::firmware25::ParameterWriteResponseArbId(deviceId_);
 }
 
 void SparkBase::SendControlMessage(
@@ -274,9 +319,10 @@ void SparkBase::SetParameter(
       }
     };
 
-  // Create CAN data and arbitration ID
+  // Firmware 25 writes use one request ID. Byte 0 is the parameter ID and
+  // bytes 1..4 are its little-endian 32-bit representation.
   std::vector<uint8_t> data(5, 0);
-  uint32_t arbId = CreateParamArbId(parameterId);
+  data[0] = static_cast<uint8_t>(parameterId);
 
   // Process the value based on its type and fill CAN data
   std::visit(
@@ -289,128 +335,127 @@ void SparkBase::SetParameter(
         if (minValue && maxValue && (v < minValue.value() || v > maxValue.value())) {
           throwRangeError(minValue.value(), maxValue.value());
         }
-        std::memcpy(data.data(), &v, sizeof(v));         // Copy float to CAN data
-      } else if constexpr (std::is_integral_v<T>) {
-        std::memcpy(data.data(), &v, sizeof(v));         // Copy integer to CAN data
+        std::memcpy(data.data() + 1, &v, sizeof(v));
       } else if constexpr (std::is_same_v<T, bool>) {
-        data[0] = v ? 1 : 0;         // Handle boolean type
+        uint32_t raw = v ? 1u : 0u;
+        std::memcpy(data.data() + 1, &raw, sizeof(raw));
+      } else if constexpr (std::is_integral_v<T>) {
+        uint32_t raw = static_cast<uint32_t>(v);
+        std::memcpy(data.data() + 1, &raw, sizeof(raw));
       } else {
         throw std::invalid_argument(RED "Unsupported value type." RESET);
       }
     },
     value);
 
-  data[4] = parameterType;     // Add parameter type to CAN data
-  SendCanFrame(arbId, data);   // Send CAN frame with parameter data
+  can_frame request{};
+  request.can_id = CreateParamWriteArbId() | CAN_EFF_FLAG;
+  request.can_dlc = static_cast<uint8_t>(data.size());
+  std::memcpy(request.data, data.data(), data.size());
+
+  can_frame response = RequestResponse(request, CreateParamWriteResponseArbId());
+  if (response.can_dlc != 7) {
+    throw std::runtime_error(
+      "Malformed write acknowledgement for " + parameterName +
+      ": expected DLC 7, got " + std::to_string(response.can_dlc));
+  }
+  if (response.data[0] != static_cast<uint8_t>(parameterId)) {
+    throw std::runtime_error(
+      "Write acknowledgement parameter mismatch for " + parameterName);
+  }
+  if (response.data[1] != parameterType) {
+    throw std::runtime_error(
+      "Write acknowledgement type mismatch for " + parameterName +
+      ": expected " + std::to_string(parameterType) + ", got " +
+      std::to_string(response.data[1]));
+  }
+  if (response.data[6] != 0) {
+    throw std::runtime_error(
+      "Controller rejected parameter " + parameterName +
+      " with result code " + std::to_string(response.data[6]));
+  }
 }
 
-std::optional<std::variant<float, uint32_t, bool>> SparkBase::ReadParameter(Parameter parameterId)
+std::variant<float, uint32_t, bool> SparkBase::ReadParameter(
+  Parameter parameterId, uint8_t parameterType)
 {
-  struct can_frame request = {};
-  uint32_t requestarbId = CreateParamArbId(parameterId);
-  request.can_id = requestarbId | CAN_EFF_FLAG;
-  request.can_dlc = 0;
+  can_frame request{};
+  uint32_t requestArbId = CreateParamReadArbId(parameterId);
+  request.can_id = requestArbId | CAN_EFF_FLAG | CAN_RTR_FLAG;
+  request.can_dlc = 8;
 
-  if (write(soc_, &request, sizeof(request)) < 0) {
-    perror("Error sending CAN message");
-    return std::nullopt;
+  can_frame response = RequestResponse(request, requestArbId);
+  if (response.can_dlc != 8) {
+    throw std::runtime_error(
+      "Malformed paired parameter response: expected DLC 8, got " +
+      std::to_string(response.can_dlc));
   }
 
-  struct can_frame response = {};
-  struct timeval tv = {0, READ_TIMEOUT_US};
-  fd_set read_fds;
-  FD_ZERO(&read_fds);
-  FD_SET(soc_, &read_fds);
-
-  int ret = select(soc_ + 1, &read_fds, nullptr, nullptr, &tv);
-  if (ret > 0) {
-    ssize_t bytesRead = read(soc_, &response, sizeof(response));
-    if (bytesRead > 0) {
-      uint32_t receivedarbId = response.can_id & CAN_EFF_MASK;
-      if (receivedarbId == requestarbId) {
-        uint8_t type = response.data[4];
-        switch (type) {
-          case 0x01: {
-              uint32_t val = 0;
-              for (int i = 0; i < 4; ++i) {
-                val |= static_cast<uint32_t>(response.data[i]) << (8 * i);
-              }
-              return val;
-            }
-          case 0x02: {
-              float val;
-              std::memcpy(&val, response.data, sizeof(float));
-              return val;
-            }
-          case 0x03: {
-              return static_cast<bool>(response.data[0] != 0);
-            }
-        }
-      }
+  const size_t offset = (static_cast<uint32_t>(parameterId) & 1u) ? 4u : 0u;
+  switch (parameterType) {
+    case PARAM_TYPE_INT:
+    case PARAM_TYPE_UINT: {
+      uint32_t value = 0;
+      std::memcpy(&value, response.data + offset, sizeof(value));
+      return value;
     }
+    case PARAM_TYPE_FLOAT: {
+      float value = 0.0f;
+      std::memcpy(&value, response.data + offset, sizeof(value));
+      return value;
+    }
+    case PARAM_TYPE_BOOL: {
+      uint32_t value = 0;
+      std::memcpy(&value, response.data + offset, sizeof(value));
+      return value != 0;
+    }
+    default:
+      throw std::invalid_argument(
+        "Unsupported firmware-25 parameter type " + std::to_string(parameterType));
   }
-  return std::nullopt;
 }
 
 template<typename T> T SparkBase::GetParamAs(Parameter param, const char * name)
 {
-  auto result = ReadParameter(param);
-  if (!result.has_value()) {
-    std::cerr << YELLOW << "No response for parameter " << name << ", using default value.\n" <<
-      RESET;
-    if constexpr (std::is_same_v<T, float>) {
-      return 0.0f;
-    } else if constexpr (std::is_same_v<T, bool>) {
-      return false;
-    } else {
-      return static_cast<T>(0);
-    }
-  }
-
+  constexpr uint8_t parameterType = std::is_same_v<T, float> ? PARAM_TYPE_FLOAT :
+    (std::is_same_v<T, bool> ? PARAM_TYPE_BOOL : PARAM_TYPE_UINT);
+  auto result = ReadParameter(param, parameterType);
   if constexpr (std::is_same_v<T, float>) {
-    if (std::holds_alternative<float>(*result)) {
-      return std::get<float>(*result);
+    if (std::holds_alternative<float>(result)) {
+      return std::get<float>(result);
     }
-    std::cerr << RED << "Wrong type for parameter " << name << ", using default float.\n" << RESET;
-    return 0.0f;
   } else if constexpr (std::is_same_v<T, bool>) {
-    if (std::holds_alternative<bool>(*result)) {
-      return std::get<bool>(*result);
+    if (std::holds_alternative<bool>(result)) {
+      return std::get<bool>(result);
     }
-    std::cerr << RED << "Wrong type for parameter " << name << ", using default bool.\n" << RESET;
-    return false;
   } else if constexpr (std::is_same_v<T, uint8_t>) {
-    if (std::holds_alternative<uint32_t>(*result)) {
-      return static_cast<uint8_t>(std::get<uint32_t>(*result));
+    if (std::holds_alternative<uint32_t>(result)) {
+      return static_cast<uint8_t>(std::get<uint32_t>(result));
     }
-    std::cerr << RED << "Wrong type for parameter " << name << ", using default uint8_t.\n" <<
-      RESET;
-    return 0;
   } else if constexpr (std::is_same_v<T, uint16_t>) {
-    if (std::holds_alternative<uint32_t>(*result)) {
-      return static_cast<uint16_t>(std::get<uint32_t>(*result));
+    if (std::holds_alternative<uint32_t>(result)) {
+      return static_cast<uint16_t>(std::get<uint32_t>(result));
     }
-    std::cerr << RED << "Wrong type for parameter " << name << ", using default uint16_t.\n" <<
-      RESET;
-    return 0;
   } else if constexpr (std::is_same_v<T, uint32_t>) {
-    if (std::holds_alternative<uint32_t>(*result)) {
-      return std::get<uint32_t>(*result);
+    if (std::holds_alternative<uint32_t>(result)) {
+      return std::get<uint32_t>(result);
     }
-    std::cerr << RED << "Wrong type for parameter " << name << ", using default uint32_t.\n" <<
-      RESET;
-    return 0;
   } else {
     static_assert(sizeof(T) == 0, "Unsupported type");
   }
+
+  throw std::runtime_error(std::string("Wrong decoded type for parameter ") + name);
 }
 
-template<typename T> T SparkBase::GetPIDParam(Parameter baseParam, uint8_t slot, const char * name)
+template<typename T> T SparkBase::GetPIDParam(
+  Parameter baseParam, uint8_t slot, const char * name, uint8_t slotStride)
 {
   if (slot >= 4) {
     throw std::out_of_range("Invalid slot number");
   }
-  return GetParamAs<T>(static_cast<Parameter>(static_cast<int>(baseParam) + slot), name);
+  return GetParamAs<T>(
+    static_cast<Parameter>(sparkcan::firmware25::SlotParameterId(
+      static_cast<uint32_t>(baseParam), slot, slotStride)), name);
 }
 
 std::optional<std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, bool>> SparkBase::ReadFirmwareVersion()
@@ -456,6 +501,21 @@ std::optional<std::tuple<uint8_t, uint8_t, uint8_t, uint8_t, bool>> SparkBase::R
 void SparkBase::HandlePeriodicFrame(const can_frame& response)
 {
   uint32_t receivedArbId = response.can_id & CAN_EFF_MASK;
+
+  bool routedResponse = false;
+  {
+    std::lock_guard<std::mutex> responseLock(responseMutex_);
+    if (pendingResponseId_ && *pendingResponseId_ == receivedArbId &&
+        !(response.can_id & CAN_RTR_FLAG)) {
+      pendingResponse_ = response;
+      routedResponse = true;
+    }
+  }
+  if (routedResponse) {
+    responseCv_.notify_one();
+    return;
+  }
+
   uint64_t rawValue      = 0;
   for (int i = 0; i < response.can_dlc; ++i)
     rawValue |= uint64_t(response.data[i]) << (8 * i);
@@ -1107,7 +1167,7 @@ void SparkBase::SetOutputMin(uint8_t slot, float min)
     throw std::out_of_range(RED "Invalid slot number. Max value is 3." RESET);
   }
 
-  SetParameter(params[slot], PARAM_TYPE_FLOAT, "Output Min", min);
+  SetParameter(params[slot], PARAM_TYPE_FLOAT, "Output Min", min, -1.0f, 1.0f);
 }
 
 void SparkBase::SetOutputMax(uint8_t slot, float max)
@@ -1119,7 +1179,7 @@ void SparkBase::SetOutputMax(uint8_t slot, float max)
     throw std::out_of_range(RED "Invalid slot number. Max value is 3." RESET);
   }
 
-  SetParameter(params[slot], PARAM_TYPE_FLOAT, "Output Max", max);
+  SetParameter(params[slot], PARAM_TYPE_FLOAT, "Output Max", max, -1.0f, 1.0f);
 }
 
 // Limits //
@@ -1762,51 +1822,57 @@ uint16_t SparkBase::GetHallSensorAverageDepth()
 
 float SparkBase::GetSmartMotionMaxVelocity(uint8_t slot)
 {
-  return GetPIDParam<float>(Parameter::kSmartMotionMaxVelocity_0, slot, "SmartMotionMaxVelocity");
+  return GetPIDParam<float>(
+    Parameter::kSmartMotionMaxVelocity_0, slot, "SmartMotionMaxVelocity", 5);
 }
 
 float SparkBase::GetSmartMotionMaxAccel(uint8_t slot)
 {
-  return GetPIDParam<float>(Parameter::kSmartMotionMaxAccel_0, slot, "SmartMotionMaxAccel");
+  return GetPIDParam<float>(
+    Parameter::kSmartMotionMaxAccel_0, slot, "SmartMotionMaxAccel", 5);
 }
 
 float SparkBase::GetSmartMotionMinVelOutput(uint8_t slot)
 {
-  return GetPIDParam<float>(Parameter::kSmartMotionMinVelOutput_0, slot, "SmartMotionMinVelOutput");
+  return GetPIDParam<float>(
+    Parameter::kSmartMotionMinVelOutput_0, slot, "SmartMotionMinVelOutput", 5);
 }
 
 float SparkBase::GetSmartMotionAllowedClosedLoopError(uint8_t slot)
 {
   return GetPIDParam<float>(
     Parameter::kSmartMotionAllowedClosedLoopError_0, slot,
-    "SmartMotionAllowedClosedLoopError");
+    "SmartMotionAllowedClosedLoopError", 5);
 }
 
 float SparkBase::GetSmartMotionAccelStrategy(uint8_t slot)
 {
   return GetPIDParam<float>(
     Parameter::kSmartMotionAccelStrategy_0, slot,
-    "SmartMotionAccelStrategy");
+    "SmartMotionAccelStrategy", 5);
 }
 
 float SparkBase::GetIMaxAccum(uint8_t slot)
 {
-  return GetPIDParam<float>(Parameter::kIMaxAccum_0, slot, "IMaxAccum");
+  return GetPIDParam<float>(Parameter::kIMaxAccum_0, slot, "IMaxAccum", 4);
 }
 
 float SparkBase::GetSlot3Placeholder1(uint8_t slot)
 {
-  return GetPIDParam<float>(Parameter::kSlot3Placeholder1_0, slot, "Slot3Placeholder1");
+  return GetPIDParam<float>(
+    Parameter::kSlot3Placeholder1_0, slot, "Slot3Placeholder1", 4);
 }
 
 float SparkBase::GetSlot3Placeholder2(uint8_t slot)
 {
-  return GetPIDParam<float>(Parameter::kSlot3Placeholder2_0, slot, "Slot3Placeholder2");
+  return GetPIDParam<float>(
+    Parameter::kSlot3Placeholder2_0, slot, "Slot3Placeholder2", 4);
 }
 
 float SparkBase::GetSlot3Placeholder3(uint8_t slot)
 {
-  return GetPIDParam<float>(Parameter::kSlot3Placeholder3_0, slot, "Slot3Placeholder3");
+  return GetPIDParam<float>(
+    Parameter::kSlot3Placeholder3_0, slot, "Slot3Placeholder3", 4);
 }
 
 // Analog Sensor //

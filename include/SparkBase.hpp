@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -40,11 +41,43 @@
 #define DEVICE_TYPE 0x02  ///< Device type for SPARK controllers
 #define MANUFACTURER 0x05 ///< Manufacturer ID for REV Robotics
 
-#define READ_TIMEOUT_US 20000 ///< Timeout for reading CAN messages in microseconds
+#define READ_TIMEOUT_US 50000 ///< Timeout for request/response CAN messages in microseconds
 
-constexpr uint8_t PARAM_TYPE_UINT = 0x01;  ///< Parameter type for unsigned integers
-constexpr uint8_t PARAM_TYPE_FLOAT = 0x02; ///< Parameter type for floating-point numbers
-constexpr uint8_t PARAM_TYPE_BOOL = 0x03;  ///< Parameter type for boolean values
+// Firmware 25 parameter type codes returned in write acknowledgements.
+constexpr uint8_t PARAM_TYPE_INT = 0x01;
+constexpr uint8_t PARAM_TYPE_UINT = 0x02;
+constexpr uint8_t PARAM_TYPE_FLOAT = 0x03;
+constexpr uint8_t PARAM_TYPE_BOOL = 0x04;
+
+constexpr uint32_t PARAM_READ_PAIR_BASE = 0x02053C00;
+constexpr uint32_t PARAM_WRITE_REQUEST_BASE = 0x02053800;
+constexpr uint32_t PARAM_WRITE_RESPONSE_BASE = 0x02053840;
+constexpr int PARAM_REQUEST_ATTEMPTS = 3;
+
+namespace sparkcan::firmware25
+{
+constexpr uint32_t ParameterReadArbId(uint8_t deviceId, uint32_t parameterId)
+{
+  const uint32_t evenParameterId = parameterId & ~uint32_t{1};
+  return PARAM_READ_PAIR_BASE + (evenParameterId / 2) * 0x40 + deviceId;
+}
+
+constexpr uint32_t ParameterWriteArbId(uint8_t deviceId)
+{
+  return PARAM_WRITE_REQUEST_BASE + deviceId;
+}
+
+constexpr uint32_t ParameterWriteResponseArbId(uint8_t deviceId)
+{
+  return PARAM_WRITE_RESPONSE_BASE + deviceId;
+}
+
+constexpr uint32_t SlotParameterId(
+  uint32_t slotZeroParameterId, uint8_t slot, uint8_t slotStride = 8)
+{
+  return slotZeroParameterId + static_cast<uint32_t>(slot) * slotStride;
+}
+} // namespace sparkcan::firmware25
 
 /**
  * @brief API commands for the SPARK controller
@@ -188,7 +221,8 @@ enum class Parameter : uint32_t
   kEncoderAverageDepth = 70,
   kEncoderSampleDelta = 71,
   kEncoderInverted = 72,
-  kClosedLoopVoltageMode = 74,
+  kVoltageCompensationMode = 74,
+  kClosedLoopVoltageMode = kVoltageCompensationMode, // compatibility alias
   kCompensatedNominalVoltage = 75,
   kSmartMotionMaxVelocity_0 = 76,
   kSmartMotionMaxAccel_0 = 77,
@@ -728,6 +762,11 @@ private:
   struct ifreq ifr_;             ///< Interface request structure for CAN operations
 
   mutable std::mutex mutex_;     ///< Mutex for thread safety
+  std::mutex parameterTransactionMutex_;
+  std::mutex responseMutex_;
+  std::condition_variable responseCv_;
+  std::optional<uint32_t> pendingResponseId_;
+  std::optional<struct can_frame> pendingResponse_;
   // std::thread thread_;           ///< Thread for reading periodic status messages
   // std::atomic_bool run_{true};   ///< Flag to control the reading thread
 
@@ -765,6 +804,15 @@ private:
    */
   void SendCanFrame(uint32_t arbId, const std::vector<uint8_t> & data) const;
 
+  /** Sends an already constructed CAN frame, including RTR frames. */
+  void SendRawCanFrame(const struct can_frame & frame) const;
+
+  /** Sends a request and waits for the RX thread to route its response. */
+  struct can_frame RequestResponse(
+    const struct can_frame & request, uint32_t responseArbId,
+    std::chrono::microseconds timeout = std::chrono::microseconds(READ_TIMEOUT_US),
+    int attempts = PARAM_REQUEST_ATTEMPTS);
+
   /**
    * @brief Sends a control message to the SPARK controller
    *
@@ -797,7 +845,11 @@ private:
    * @param paramId The parameter ID to encode in the arbitration ID
    * @return uint32_t The created frame ID
    */
-  uint32_t CreateParamArbId(Parameter paramId) const;
+  uint32_t CreateParamReadArbId(Parameter paramId) const;
+
+  uint32_t CreateParamWriteArbId() const;
+
+  uint32_t CreateParamWriteResponseArbId() const;
 
   /**
    * @brief Gets the API class from an API command
@@ -850,11 +902,12 @@ private:
    * @return std::optional<std::variant<float, uint32_t, bool>> The parameter value if received, or std::nullopt if no
    * response
    */
-  std::optional<std::variant<float, uint32_t, bool>> ReadParameter(Parameter parameterId);
+  std::variant<float, uint32_t, bool> ReadParameter(
+    Parameter parameterId, uint8_t parameterType);
 
   /**
    * @brief Internal helper to get a parameter as a specific type
-   *        If no response or wrong type, returns default based on type
+   *        Timeouts and malformed responses are reported as exceptions.
    * @tparam T The expected return type
    * @param param The parameter ID
    * @param name A debug name used in error messages
@@ -871,7 +924,8 @@ private:
    * @param name A debug name used in error messages
    * @return Value of the slot-specific parameter
    */
-  template<typename T> T GetPIDParam(Parameter baseParam, uint8_t slot, const char * name);
+  template<typename T> T GetPIDParam(
+    Parameter baseParam, uint8_t slot, const char * name, uint8_t slotStride = 8);
 
 public:
   /**

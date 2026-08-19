@@ -9,6 +9,32 @@ pip install .
 
 This works with firmware 25.0.X
 
+### Firmware 25 PID parameters
+
+The Python bindings support acknowledged, non-persistent reads and writes for
+all four closed-loop PID slots on firmware 25.0.x:
+
+```python
+from sparkcan_py import SparkMax
+
+motor = SparkMax("can0", 1)
+
+# Read all eight values from slot 0. Read failures raise an exception.
+print(motor.ReadPIDSlot(0))
+
+# Each write waits for and validates the controller acknowledgement.
+motor.SetP(0, 0.2)
+motor.SetI(0, 0.0)
+motor.SetD(0, 0.1)
+motor.SetVelocityFF(0, 0.0)  # SetF is retained as a compatibility alias.
+motor.SetIZone(0, 0.0)
+motor.SetDFilter(0, 0.0)
+motor.SetOutputMin(0, -1.0)
+motor.SetOutputMax(0, 1.0)
+```
+
+These setters update RAM only. They do not burn parameters to flash.
+
 Original sparkcan library readme below. This is a modified fork of https://github.com/grayson-arendt/sparkcan.git
 
 #### Disclaimer
@@ -17,7 +43,7 @@ This project is not affiliated with, endorsed by, or in any way connected to REV
 #### Setup
 A USB to CAN adapter such as a [CANable](https://canable.io/) is required. This package has been tested with the [Spark MAX](https://www.revrobotics.com/rev-11-2158/) and [SPARK Flex](https://www.revrobotics.com/rev-11-2159/).
 
-Make sure to use [REV Hardware Client](https://docs.revrobotics.com/rev-hardware-client/gs/install) to set the `device ID` for your controllers and modify the values to match them in the examples.  Ensure the correct motor type is set to either `kBrushed` or `kBrushless` depending on your motor, as it may damage the motor if set to the wrong type. This library will only work with **firmware 24.0.X**, it will not work with the new 25.0.X releases, therefore **do not update** the motor controller in REV Hardware Client.
+Make sure to use [REV Hardware Client](https://docs.revrobotics.com/rev-hardware-client/gs/install) to set the `device ID` for your controllers and modify the values to match them in the examples. Ensure the correct motor type is set to either `kBrushed` or `kBrushless` depending on your motor, as it may damage the motor if set to the wrong type. This fork targets **firmware 25.0.x**; PID parameter transport has been hardware-tested with firmware **25.0.4**.
 
 
 #### Installation
